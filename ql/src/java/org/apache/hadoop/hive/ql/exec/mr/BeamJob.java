@@ -148,14 +148,14 @@ public class BeamJob {
       this.jobConfObj = new SerializableWritable<>(jobConf);
     }
 
-    // @Setup
+    @Setup
     public void setup() throws IOException {
       checkArgument(jobConfObj.get().getMapperClass().equals(ExecMapper.class));
       reducer = ReflectionUtils.newInstance(ExecReducer.class, jobConfObj.get());
       reducer.configure(jobConfObj.get());
     }
 
-    @StartBundle
+    // @StartBundle
     public void startBundle(Context c) throws IOException {
       setup();
     }
@@ -185,13 +185,15 @@ public class BeamJob {
           outputCollector, Reporter.NULL);
     }
 
-    @FinishBundle
+    // @FinishBundle
     public void finishBundle(Context c) throws IOException {
+      LOG.info("XXX closing Reducer");
       tearDown();
     }
 
-    // @Teardown
+    @Teardown
     public void tearDown() {
+      LOG.info("XXX Reducer tearDown.");
       reducer.close();
     }
   }
