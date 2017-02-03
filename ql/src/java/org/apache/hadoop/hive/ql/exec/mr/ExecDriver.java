@@ -432,6 +432,7 @@ public class ExecDriver extends Task<MapredWork> implements Serializable, Hadoop
 
       if (HiveConf.getBoolVar(job, HiveConf.ConfVars.LLAP_WEB_AUTO_AUTH, false)) {
         new BeamJob().submit(job).waitUntilFinish(); // XXX
+        LOG.info("XXX Completed DirectRunner pipeline");
       } else {
         // Finally SUBMIT the JOB!
         rj = jc.submitJob(job);

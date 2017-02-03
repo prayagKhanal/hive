@@ -2,6 +2,7 @@ package org.apache.hadoop.hive.ql.exec.mr;
 
 import static com.google.common.base.Preconditions.checkArgument;
 
+import com.google.common.collect.Iterables;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
@@ -18,6 +19,7 @@ import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.PipelineResult;
 import org.apache.beam.sdk.coders.AtomicCoder;
 import org.apache.beam.sdk.coders.Coder;
+import org.apache.beam.sdk.coders.Coder.Context;
 import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.io.BoundedSource;
 import org.apache.beam.sdk.io.BoundedSource.BoundedReader;
@@ -29,11 +31,12 @@ import org.apache.beam.sdk.transforms.GroupByKey;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
-import org.apache.hadoop.hive.shims.CombineHiveKey;
-import org.apache.hadoop.io.BytesWritable;
+import org.apache.hadoop.hive.ql.io.HiveKey;
 import org.apache.hadoop.io.DataInputBuffer;
+import org.apache.hadoop.io.DataOutputBuffer;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.io.WritableComparable;
+import org.apache.hadoop.io.WritableUtils;
 import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.mapred.InputSplit;
 import org.apache.hadoop.mapred.JobConf;
@@ -58,7 +61,7 @@ public class BeamJob {
   }
 
   private static Coder<KV<WritableComparable, Writable>> KV_CODER =
-      KvCoder.of(new WritableCoder(CombineHiveKey.class), new WritableCoder(BytesWritable.class));
+      KvCoder.of(new WritableCoder<WritableComparable>(), new WritableCoder<Writable>());
 
   public PipelineResult submit(JobConf jobConf) {
 
@@ -95,29 +98,41 @@ public class BeamJob {
       this.jobConfObj = new SerializableWritable<>(jobConf);
     }
 
-    @Setup
+    // @Setup
     public void setup() throws IOException {
       checkArgument(jobConfObj.get().getMapperClass().equals(ExecMapper.class));
       mapper = ReflectionUtils.newInstance(ExecMapper.class, jobConfObj.get());
       mapper.configure(jobConfObj.get());
     }
 
+    @StartBundle
+    public void startBundle(Context c) throws IOException {
+      setup();
+    }
+
     @ProcessElement
     public void processElement(final ProcessContext c) throws IOException {
+
+      LOG.info("XXX : Mapper Got " + c.element().toString());
 
       OutputCollector<Object, Object> outputCollector = new OutputCollector<Object, Object>() {
         @Override
         public void collect(Object key, Object value) throws IOException {
-          c.output(KV.of((WritableComparable) key, (Writable) value));
+          LOG.info("XXX : Mapper Collecting " + KV.of(key, value));
+          c.output(KV.of(copyWritable((WritableComparable) key), copyWritable((Writable) value)));
         }
       };
 
-      LOG.info("XXX : Got " + c.element().toString());
-
-      mapper.map(c.element().getKey(), c.element().getValue(), outputCollector, null);
+      mapper.map(copyWritable(c.element().getKey()),
+          copyWritable(c.element().getValue()), outputCollector, Reporter.NULL);
     }
 
-    @Teardown
+    @FinishBundle
+    public void finishBundle(Context c) throws IOException {
+      tearDown();
+    }
+
+    // @Teardown
     public void tearDown() {
       mapper.close();
     }
@@ -133,11 +148,16 @@ public class BeamJob {
       this.jobConfObj = new SerializableWritable<>(jobConf);
     }
 
-    @Setup
+    // @Setup
     public void setup() throws IOException {
       checkArgument(jobConfObj.get().getMapperClass().equals(ExecMapper.class));
       reducer = ReflectionUtils.newInstance(ExecReducer.class, jobConfObj.get());
       reducer.configure(jobConfObj.get());
+    }
+
+    @StartBundle
+    public void startBundle(Context c) throws IOException {
+      setup();
     }
 
     @ProcessElement
@@ -146,15 +166,31 @@ public class BeamJob {
       OutputCollector<Object, Object> outputCollector = new OutputCollector<Object, Object>() {
         @Override
         public void collect(Object key, Object value) throws IOException {
-          c.output(KV.of((WritableComparable) key, (Writable) value));
+          LOG.info("XXX : Reducer Collecting " + KV.of(key, value));
+          c.output(KV.of(copyWritable((WritableComparable) key), copyWritable((Writable) value)));
         }
       };
 
+      LOG.info("XXX : Reducer Got " + c.element().toString());
+
+      // may be there is no need to copy values.
+      List<Writable> values = new ArrayList<Writable>();
+      for (Writable v : c.element().getValue()) {
+        values.add(copyWritable(v));
+      }
+
       reducer.reduce(
-          c.element().getKey(), c.element().getValue().iterator(), outputCollector, null);
+          c.element().getKey(),
+          values.iterator(),
+          outputCollector, Reporter.NULL);
     }
 
-    @Teardown
+    @FinishBundle
+    public void finishBundle(Context c) throws IOException {
+      tearDown();
+    }
+
+    // @Teardown
     public void tearDown() {
       reducer.close();
     }
@@ -228,16 +264,16 @@ public class BeamJob {
 
     private final HiveInputFormatSource source;
     private final RecordReader<WritableComparable, Writable> reader;
-    private final WritableComparable key;
-    private final Writable value;
-
+    private WritableComparable key = null;
+    private Writable value = null;
+    private KV<WritableComparable, Writable> kv = null;
 
     HiveRecordReader(HiveInputFormatSource source,
                      RecordReader<WritableComparable, Writable> reader) {
       this.source = source;
       this.reader = reader;
-      key = reader.createKey();
-      value = reader.createValue();
+      this.key = reader.createKey();
+      this.value = reader.createValue();
     }
 
     @Nullable
@@ -263,13 +299,17 @@ public class BeamJob {
 
     @Override
     public boolean advance() throws IOException {
-      return reader.next(key, value);
+      boolean hasNext = reader.next(key, value);
+      if (hasNext) {
+        LOG.info("XXX : Got " + key + " - " + value + " - " + key.getClass());
+        kv = KV.of(copyWritable(key), copyWritable(value));
+      }
+      return hasNext;
     }
 
     @Override
     public KV<WritableComparable, Writable> getCurrent() throws NoSuchElementException {
-      LOG.info("XXX : Got " + ((CombineHiveKey)key).getKey() + " - " + value + " - " + ((CombineHiveKey)key).getKey().getClass());
-      return KV.of(key, value);
+      return kv;
     }
 
     @Override
@@ -280,23 +320,25 @@ public class BeamJob {
 
   private static class WritableCoder<W extends Writable> extends AtomicCoder<W> {
 
-    private final Class<W> clazz;
-
-    WritableCoder(Class<W> clazz) {
-      this.clazz = clazz;
+    WritableCoder() {
     }
 
     public void encode(W value, OutputStream outStream, Context context)
         throws IOException {
-      value.write(new DataOutputStream(outStream));
+      // LOG.info("XXX encoding " + value.getClass() + " value " + value);
+      DataOutputStream dataOut = new DataOutputStream(outStream);
+      WritableUtils.writeString(dataOut, value.getClass().getName());
+      value.write(dataOut);
     }
 
     @Override
     public W decode(InputStream inStream, Context context)
         throws IOException {
       try {
-        W writable = (W) clazz.newInstance();
-        writable.readFields(new DataInputStream(inStream));
+        DataInputStream dataIn = new DataInputStream(inStream);
+        Class<W> clazz = (Class<W>) Class.forName(WritableUtils.readString(dataIn));
+        W writable = clazz.newInstance();
+        writable.readFields(dataIn);
         return writable;
       } catch (IOException e) {
         throw e;
@@ -318,6 +360,19 @@ public class BeamJob {
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
+  }
+
+  static <T extends Writable> T copyWritable(T writable) throws IOException { // yuck...
+    if (writable instanceof HiveKey) {
+      HiveKey key = (HiveKey) writable;
+      return (T) new HiveKey(key.copyBytes(), key.hashCode());
+    }
+    WritableCoder<T> coder = new WritableCoder<T>();
+    DataOutputBuffer outStream = new DataOutputBuffer();
+    coder.encode(writable, outStream, Context.OUTER);
+    DataInputBuffer inStream = new DataInputBuffer();
+    inStream.reset(outStream.getData(), outStream.getLength());
+    return coder.decode(inStream, Context.OUTER);
   }
 
   private static class SerializableWritable<W extends Writable> implements Serializable {

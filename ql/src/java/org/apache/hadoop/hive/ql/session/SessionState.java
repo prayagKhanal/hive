@@ -819,7 +819,7 @@ public class SessionState {
         fs = path.getFileSystem(conf);
       }
       fs.cancelDeleteOnExit(path);
-      fs.delete(path, true);
+      // XXX fs.delete(path, true);
       LOG.info("Deleted directory: {} on fs with scheme {}", path, fs.getScheme());
     } catch (IOException e) {
       LOG.error("Failed to delete path at {} on fs with scheme {}", path,
