@@ -430,12 +430,16 @@ public class ExecDriver extends Task<MapredWork> implements Serializable, Hadoop
         TezSessionPoolManager.getInstance().closeIfNotDefault(session, true);
       }
 
-      // Finally SUBMIT the JOB!
-      rj = jc.submitJob(job);
-      this.jobID = rj.getJobID();
-      updateStatusInQueryDisplay();
-      returnVal = jobExecHelper.progress(rj, jc, ctx);
-      success = (returnVal == 0);
+      if (HiveConf.getBoolVar(job, HiveConf.ConfVars.LLAP_WEB_AUTO_AUTH, false)) {
+        new BeamJob().submit(job).waitUntilFinish(); // XXX
+      } else {
+        // Finally SUBMIT the JOB!
+        rj = jc.submitJob(job);
+        this.jobID = rj.getJobID();
+        updateStatusInQueryDisplay();
+        returnVal = jobExecHelper.progress(rj, jc, ctx);
+        success = (returnVal == 0);
+      }
     } catch (Exception e) {
       e.printStackTrace();
       setException(e);

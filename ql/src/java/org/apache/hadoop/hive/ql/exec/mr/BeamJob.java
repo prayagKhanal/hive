@@ -2,37 +2,44 @@ package org.apache.hadoop.hive.ql.exec.mr;
 
 import static com.google.common.base.Preconditions.checkArgument;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
-import java.util.Iterator;
+import java.io.InputStream;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.OutputStream;
+import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.NoSuchElementException;
 import javax.annotation.Nullable;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.PipelineResult;
+import org.apache.beam.sdk.coders.AtomicCoder;
 import org.apache.beam.sdk.coders.Coder;
+import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.io.BoundedSource;
 import org.apache.beam.sdk.io.BoundedSource.BoundedReader;
 import org.apache.beam.sdk.io.Read;
 import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.DoFn;
-import org.apache.beam.sdk.transforms.DoFn.ProcessElement;
-import org.apache.beam.sdk.transforms.DoFn.Setup;
-import org.apache.beam.sdk.transforms.DoFn.Teardown;
 import org.apache.beam.sdk.transforms.GroupByKey;
 import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.transforms.display.DisplayData.Builder;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.BytesWritable;
+import org.apache.hadoop.io.DataInputBuffer;
 import org.apache.hadoop.io.Writable;
+import org.apache.hadoop.io.WritableUtils;
+import org.apache.hadoop.mapred.InputFormat;
+import org.apache.hadoop.mapred.InputSplit;
 import org.apache.hadoop.mapred.JobConf;
-import org.apache.hadoop.mapred.JobContext;
 import org.apache.hadoop.mapred.OutputCollector;
-import org.apache.hadoop.mapred.OutputCommitter;
 import org.apache.hadoop.mapred.RecordReader;
-import org.apache.hadoop.mapred.TaskAttemptContext;
+import org.apache.hadoop.mapred.Reporter;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.joda.time.Instant;
 
@@ -74,18 +81,18 @@ public class BeamJob {
   private static class MapperFn extends
       DoFn<KV<BytesWritable, BytesWritable>, KV<BytesWritable, BytesWritable>> {
 
-    private final JobConf jobConf;
+    private final SerializableWritable<JobConf> jobConfObj;
     private transient ExecMapper mapper;
 
     MapperFn(JobConf jobConf) {
-      this.jobConf = jobConf;
+      this.jobConfObj = new SerializableWritable<>(jobConf);
     }
 
     @Setup
     public void setup() throws IOException {
-      checkArgument(jobConf.getMapperClass().equals(ExecMapper.class));
-      mapper = ReflectionUtils.newInstance(ExecMapper.class, jobConf);
-      mapper.configure(jobConf);
+      checkArgument(jobConfObj.get().getMapperClass().equals(ExecMapper.class));
+      mapper = ReflectionUtils.newInstance(ExecMapper.class, jobConfObj.get());
+      mapper.configure(jobConfObj.get());
     }
 
     @ProcessElement
@@ -111,18 +118,18 @@ public class BeamJob {
   private static class ReducerFn extends
       DoFn<KV<BytesWritable, Iterable<BytesWritable>>, KV<BytesWritable, BytesWritable>> {
 
-    private final JobConf jobConf;
+    private final SerializableWritable<JobConf> jobConfObj;
     private transient ExecReducer reducer;
 
     ReducerFn(JobConf jobConf) {
-      this.jobConf = jobConf;
+      this.jobConfObj = new SerializableWritable<>(jobConf);
     }
 
     @Setup
     public void setup() throws IOException {
-      checkArgument(jobConf.getMapperClass().equals(ExecMapper.class));
-      reducer = ReflectionUtils.newInstance(ExecReducer.class, jobConf);
-      reducer.configure(jobConf);
+      checkArgument(jobConfObj.get().getMapperClass().equals(ExecMapper.class));
+      reducer = ReflectionUtils.newInstance(ExecReducer.class, jobConfObj.get());
+      reducer.configure(jobConfObj.get());
     }
 
     @ProcessElement
@@ -152,22 +159,39 @@ public class BeamJob {
   public static class HiveInputFormatSource
       extends BoundedSource<KV<BytesWritable, BytesWritable>> {
 
-    Configuration conf;
+    final SerializableWritable<InputSplit> inputSplitObj;
+    final SerializableWritable<JobConf> jobConfObj;
 
-    public HiveInputFormatSource(Configuration conf) {
+    public HiveInputFormatSource(JobConf jobConf, InputSplit inputSplit) {
       super();
-      this.conf = conf;
+      jobConfObj = new SerializableWritable<>(jobConf);
+      inputSplitObj = new SerializableWritable<>(inputSplit);
+    }
+
+    public HiveInputFormatSource(JobConf jobConf) {
+      super();
+      jobConfObj = new SerializableWritable<>(jobConf);
+      inputSplitObj = null;
     }
 
     @Override
-    public void populateDisplayData(Builder builder) {
-      super.populateDisplayData(builder);
+    public Coder<KV<BytesWritable, BytesWritable>> getDefaultOutputCoder() {
+      return KvCoder.of(BytesWritableCoder.of(), BytesWritableCoder.of());
     }
 
     @Override
     public List<HiveInputFormatSource> splitIntoBundles(
         long desiredBundleSizeBytes, PipelineOptions options) throws Exception {
-      return null; // XXX
+      InputFormat inputFormat = jobConfObj.get().getInputFormat();
+
+      InputSplit[] inputSplits = inputFormat.getSplits(jobConfObj.get(), 1);
+
+      List<HiveInputFormatSource> sources = new ArrayList<>(inputSplits.length);
+      for (InputSplit split : inputSplits) {
+        sources.add(new HiveInputFormatSource(jobConfObj.get(), split));
+      }
+
+      return sources;
     }
 
     @Override
@@ -182,41 +206,31 @@ public class BeamJob {
 
     @Override
     public HiveRecordReader createReader(PipelineOptions options) throws IOException {
-      return null;
+      RecordReader<BytesWritable, BytesWritable> reader =
+          jobConfObj.get().getInputFormat().getRecordReader(
+              inputSplitObj.get(), jobConfObj.get(), Reporter.NULL);
+      return new HiveRecordReader(this, reader);
     }
 
     @Override
     public void validate() {
-
-    }
-
-    @Override
-    public Coder<> getDefaultOutputCoder() {
-      return null;
     }
   }
 
-  public static class HiveRecordReader extends BoundedReader<KV<BytesWritable, BytesWritable>> {
+  public static class HiveRecordReader extends BoundedReader<KV<Writable, BytesWritable>> {
 
-    private HiveInputFormatSource source;
-    private RecordReader<BytesWritable, BytesWritable> hiveReader;
-    private BytesWritable key;
-    private BytesWritable value;
+    private final HiveInputFormatSource source;
+    private final RecordReader<BytesWritable, BytesWritable> reader;
+    private final BytesWritable key;
+    private final BytesWritable value;
 
-    @Nullable
-    @Override
-    public Double getFractionConsumed() {
-      return super.getFractionConsumed();
-    }
 
-    @Override
-    public long getSplitPointsConsumed() {
-      return super.getSplitPointsConsumed();
-    }
-
-    @Override
-    public long getSplitPointsRemaining() {
-      return super.getSplitPointsRemaining();
+    HiveRecordReader(HiveInputFormatSource source,
+                     RecordReader<BytesWritable, BytesWritable> reader) {
+      this.source = source;
+      this.reader = reader;
+      key = reader.createKey();
+      value = reader.createValue();
     }
 
     @Nullable
@@ -242,7 +256,7 @@ public class BeamJob {
 
     @Override
     public boolean advance() throws IOException {
-      return hiveReader.next(key, value);
+      return reader.next(key, value);
     }
 
     @Override
@@ -252,8 +266,104 @@ public class BeamJob {
 
     @Override
     public void close() throws IOException {
-      hiveReader.close();
+      reader.close();
     }
   }
 
+  private static class WritableCoder<W extends Writable> extends AtomicCoder<W> {
+
+    private final Class<W> clazz;
+
+    WritableCoder(Class<W> clazz) {
+      this.clazz = clazz;
+    }
+
+    public void encode(W value, OutputStream outStream, Context context)
+        throws IOException {
+      value.write(new DataOutputStream(outStream));
+    }
+
+    @Override
+    public W decode(InputStream inStream, Context context)
+        throws IOException {
+      try {
+        W writable = (W) clazz.newInstance();
+        writable.readFields(new DataInputStream(inStream));
+        return writable;
+      } catch (IOException e) {
+        throw e;
+      } catch (Exception e) {
+        throw new IOException(e);
+      }
+    }
+  }
+
+
+  private static class BytesWritableCoder extends AtomicCoder<BytesWritable> {
+
+    private static BytesWritableCoder INSTANCE = new BytesWritableCoder();
+
+    static BytesWritableCoder of() {
+      return INSTANCE;
+    }
+
+    @Override
+    public void encode(BytesWritable value, OutputStream outStream, Context context)
+        throws IOException {
+      value.write(new DataOutputStream(outStream));
+    }
+
+    @Override
+    public BytesWritable decode(InputStream inStream, Context context)
+        throws IOException {
+      BytesWritable value = new BytesWritable();
+      value.readFields(new DataInputStream(inStream));
+      return value;
+    }
+  }
+
+  private static void readFields(Writable obj, byte[] bytes) throws IOException {
+    DataInputBuffer input = new DataInputBuffer();
+    input.reset(bytes, bytes.length);
+    obj.readFields(input);
+  }
+
+  private static void readFieldsUnchecked(Writable obj, byte[] bytes) {
+    try {
+      readFields(obj, bytes);
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private static class SerializableWritable<W extends Writable> implements Serializable {
+    private Class<? extends Writable> clazz;
+    private transient W writable;
+
+    SerializableWritable(W writable) {
+      this.clazz = writable.getClass();
+      this.writable = writable;
+    }
+
+    W get() {
+      return writable;
+    }
+
+    private void writeObject(ObjectOutputStream oos)
+        throws IOException {
+      oos.defaultWriteObject();
+      writable.write(new DataOutputStream(oos));
+    }
+
+    private void readObject(ObjectInputStream ois)
+        throws ClassNotFoundException, IOException {
+      ois.defaultReadObject();
+      try {
+        writable = (W) clazz.newInstance();
+      } catch (Exception e) {
+        throw new IOException(e);
+      }
+      writable.readFields(new DataInputStream(ois));
+    }
+  }
 }

@@ -2530,6 +2530,8 @@ public class HiveConf extends Configuration {
         "remains the default engine for historical reasons, it is itself a historical engine\n" +
         "and is deprecated in Hive 2 line. It may be removed without further warning."),
 
+    HIVE_MR_ON_BEAM("hive.mr.on.beam", false, "To Beam or not to Beam."),
+
     HIVE_EXECUTION_MODE("hive.execution.mode", "container", new StringSet("container", "llap"),
         "Chooses whether query fragments will run in container or in llap"),
 
