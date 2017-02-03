@@ -29,11 +29,11 @@ import org.apache.beam.sdk.transforms.GroupByKey;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
-import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hive.shims.CombineHiveKey;
 import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.io.DataInputBuffer;
 import org.apache.hadoop.io.Writable;
-import org.apache.hadoop.io.WritableUtils;
+import org.apache.hadoop.io.WritableComparable;
 import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.mapred.InputSplit;
 import org.apache.hadoop.mapred.JobConf;
@@ -42,16 +42,23 @@ import org.apache.hadoop.mapred.RecordReader;
 import org.apache.hadoop.mapred.Reporter;
 import org.apache.hadoop.util.ReflectionUtils;
 import org.joda.time.Instant;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Takes HadoopConf and run Hadoop MapReduce job as a Beam pipeline
  */
 public class BeamJob {
 
+  protected static final Logger LOG = LoggerFactory.getLogger(BeamJob.class);
+
   private interface Options extends PipelineOptions {
     // set temp jars, staging and temp work directories etc
 
   }
+
+  private static Coder<KV<WritableComparable, Writable>> KV_CODER =
+      KvCoder.of(new WritableCoder(CombineHiveKey.class), new WritableCoder(BytesWritable.class));
 
   public PipelineResult submit(JobConf jobConf) {
 
@@ -62,13 +69,13 @@ public class BeamJob {
 
     Pipeline pipeline = Pipeline.create(options);
 
-    PCollection<KV<BytesWritable, BytesWritable>> elements = pipeline
+    PCollection<KV<WritableComparable, Writable>> elements = pipeline
         .apply(Read.from(new HiveInputFormatSource(jobConf)))
         .apply(ParDo.of(new MapperFn(jobConf)));
 
     if (jobConf.getNumReduceTasks() > 0) {
       elements = elements
-          .apply(GroupByKey.<BytesWritable, BytesWritable>create())
+          .apply(GroupByKey.<WritableComparable, Writable>create())
           .apply(ParDo.of(new ReducerFn(jobConf)));
     }
 
@@ -79,7 +86,7 @@ public class BeamJob {
   }
 
   private static class MapperFn extends
-      DoFn<KV<BytesWritable, BytesWritable>, KV<BytesWritable, BytesWritable>> {
+      DoFn<KV<WritableComparable, Writable>, KV<WritableComparable, Writable>> {
 
     private final SerializableWritable<JobConf> jobConfObj;
     private transient ExecMapper mapper;
@@ -98,13 +105,14 @@ public class BeamJob {
     @ProcessElement
     public void processElement(final ProcessContext c) throws IOException {
 
-      // XXX What should be the type?
       OutputCollector<Object, Object> outputCollector = new OutputCollector<Object, Object>() {
         @Override
         public void collect(Object key, Object value) throws IOException {
-          c.output(KV.of((BytesWritable) key, (BytesWritable) value));
+          c.output(KV.of((WritableComparable) key, (Writable) value));
         }
       };
+
+      LOG.info("XXX : Got " + c.element().toString());
 
       mapper.map(c.element().getKey(), c.element().getValue(), outputCollector, null);
     }
@@ -116,7 +124,7 @@ public class BeamJob {
   }
 
   private static class ReducerFn extends
-      DoFn<KV<BytesWritable, Iterable<BytesWritable>>, KV<BytesWritable, BytesWritable>> {
+      DoFn<KV<WritableComparable, Iterable<Writable>>, KV<WritableComparable, Writable>> {
 
     private final SerializableWritable<JobConf> jobConfObj;
     private transient ExecReducer reducer;
@@ -135,11 +143,10 @@ public class BeamJob {
     @ProcessElement
     public void processElement(final ProcessContext c) throws IOException {
 
-      // XXX What should be the type?
       OutputCollector<Object, Object> outputCollector = new OutputCollector<Object, Object>() {
         @Override
         public void collect(Object key, Object value) throws IOException {
-          c.output(KV.of((BytesWritable) key, (BytesWritable) value));
+          c.output(KV.of((WritableComparable) key, (Writable) value));
         }
       };
 
@@ -157,7 +164,7 @@ public class BeamJob {
    * Beam read and write transforms for Hadoop InputFormat and and Hadoop OutputFormat.
    */
   public static class HiveInputFormatSource
-      extends BoundedSource<KV<BytesWritable, BytesWritable>> {
+      extends BoundedSource<KV<WritableComparable, Writable>> {
 
     final SerializableWritable<InputSplit> inputSplitObj;
     final SerializableWritable<JobConf> jobConfObj;
@@ -175,8 +182,8 @@ public class BeamJob {
     }
 
     @Override
-    public Coder<KV<BytesWritable, BytesWritable>> getDefaultOutputCoder() {
-      return KvCoder.of(BytesWritableCoder.of(), BytesWritableCoder.of());
+    public Coder<KV<WritableComparable, Writable>> getDefaultOutputCoder() {
+      return KV_CODER;
     }
 
     @Override
@@ -206,7 +213,7 @@ public class BeamJob {
 
     @Override
     public HiveRecordReader createReader(PipelineOptions options) throws IOException {
-      RecordReader<BytesWritable, BytesWritable> reader =
+      RecordReader<WritableComparable, Writable> reader =
           jobConfObj.get().getInputFormat().getRecordReader(
               inputSplitObj.get(), jobConfObj.get(), Reporter.NULL);
       return new HiveRecordReader(this, reader);
@@ -217,16 +224,16 @@ public class BeamJob {
     }
   }
 
-  public static class HiveRecordReader extends BoundedReader<KV<Writable, BytesWritable>> {
+  public static class HiveRecordReader extends BoundedReader<KV<WritableComparable, Writable>> {
 
     private final HiveInputFormatSource source;
-    private final RecordReader<BytesWritable, BytesWritable> reader;
-    private final BytesWritable key;
-    private final BytesWritable value;
+    private final RecordReader<WritableComparable, Writable> reader;
+    private final WritableComparable key;
+    private final Writable value;
 
 
     HiveRecordReader(HiveInputFormatSource source,
-                     RecordReader<BytesWritable, BytesWritable> reader) {
+                     RecordReader<WritableComparable, Writable> reader) {
       this.source = source;
       this.reader = reader;
       key = reader.createKey();
@@ -235,7 +242,7 @@ public class BeamJob {
 
     @Nullable
     @Override
-    public BoundedSource<KV<BytesWritable, BytesWritable>> splitAtFraction(double fraction) {
+    public BoundedSource<KV<WritableComparable, Writable>> splitAtFraction(double fraction) {
       return super.splitAtFraction(fraction);
     }
 
@@ -245,7 +252,7 @@ public class BeamJob {
     }
 
     @Override
-    public BoundedSource<KV<BytesWritable, BytesWritable>> getCurrentSource() {
+    public BoundedSource<KV<WritableComparable, Writable>> getCurrentSource() {
       return source;
     }
 
@@ -260,7 +267,8 @@ public class BeamJob {
     }
 
     @Override
-    public KV<BytesWritable, BytesWritable> getCurrent() throws NoSuchElementException {
+    public KV<WritableComparable, Writable> getCurrent() throws NoSuchElementException {
+      LOG.info("XXX : Got " + ((CombineHiveKey)key).getKey() + " - " + value + " - " + ((CombineHiveKey)key).getKey().getClass());
       return KV.of(key, value);
     }
 
@@ -295,30 +303,6 @@ public class BeamJob {
       } catch (Exception e) {
         throw new IOException(e);
       }
-    }
-  }
-
-
-  private static class BytesWritableCoder extends AtomicCoder<BytesWritable> {
-
-    private static BytesWritableCoder INSTANCE = new BytesWritableCoder();
-
-    static BytesWritableCoder of() {
-      return INSTANCE;
-    }
-
-    @Override
-    public void encode(BytesWritable value, OutputStream outStream, Context context)
-        throws IOException {
-      value.write(new DataOutputStream(outStream));
-    }
-
-    @Override
-    public BytesWritable decode(InputStream inStream, Context context)
-        throws IOException {
-      BytesWritable value = new BytesWritable();
-      value.readFields(new DataInputStream(inStream));
-      return value;
     }
   }
 
